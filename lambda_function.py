@@ -73,32 +73,32 @@ def fetch_unit_wise_summary(session: requests.Session) -> BeautifulSoup:
 
 def extract_uit_alwar_link(soup: BeautifulSoup) -> str:
     """
-    Find the UIT, Alwar row, return first numeric link (total/corner/etc.) href (absolute).
+    Find the UIT, Alwar row in the Unit Wise Summary table and return the first link href.
+    Unit Name is in the 2nd column (index 1), not the first.
     """
-    # Find the unit summary table by looking for "Unit Wise Summary" heading then the next <table>
+    # Find the first table after the "Unit Wise Summary" heading, else any table
     hdr = soup.find(lambda tag: tag.name in ("h2", "h3", "h4") and "Unit Wise Summary" in tag.get_text(strip=True))
-    if not hdr:
-        # Fallback: just take the first big table
-        tables = soup.find_all("table")
-        if not tables:
-            raise ValueError("Could not find any table on summary page")
-        table = tables[0]
-    else:
-        table = hdr.find_next("table")
-        if not table:
-            raise ValueError("Could not find unit summary table")
+    table = hdr.find_next("table") if hdr else soup.find("table")
+    if not table:
+        raise ValueError("Could not find unit summary table")
 
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
-        if not tds:
-            continue
-        unit_text = " ".join(tds[0].get_text(strip=True).split())
-        if unit_text.lower().startswith("uit, alwar"):
-            link = tr.find("a")
-            if link and link.has_attr("href"):
-                href = requests.compat.urljoin(SUMMARY_URL, link["href"])
-                logger.info(f"Found UIT, Alwar link: {href}")
-                return href
+        if len(tds) >= 2:
+            unit_name = " ".join(tds[1].get_text(strip=True).split())  # <-- column 1 is Unit Name
+            if unit_name.lower().startswith("uit, alwar"):
+                a = tr.find("a", href=True)
+                if a:
+                    return requests.compat.urljoin(SUMMARY_URL, a["href"])
+
+    # Fallback: scan any row whose text mentions UIT, Alwar
+    for tr in table.find_all("tr"):
+        row_text = " ".join(tr.get_text(" ", strip=True).split()).lower()
+        if "uit" in row_text and "alwar" in row_text:
+            a = tr.find("a", href=True)
+            if a:
+                return requests.compat.urljoin(SUMMARY_URL, a["href"])
+
     raise ValueError("UIT, Alwar row not found in summary table")
 
 
