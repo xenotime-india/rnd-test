@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Monitors UIT, Alwar auctions on the Rajasthan UDH portal.
-- Scrapes UIT, Alwar schemes and plots
+Monitors UIT, Alwar:
+  1) UDH Live E-Auctions (UIT, Alwar plots)
+  2) UIT Alwar site Auction page newsletters (docs)
+
 - Compares with last-saved state in S3
-- Sends ONE Telegram message per new plot (HTML formatted, includes detail link when available)
-- Saves current state back to S3
+- Sends ONE Telegram message per new plot/news item (HTML formatted, includes link)
+- Saves current state back to S3 (separate keys for plots and news)
 
 ENV VARS (required):
   BUCKET_NAME                         -> S3 bucket (e.g., jda-auction-list)
-  OBJECT_KEY                          -> S3 key for state json (default: uit_alwar_plots.json)
+  OBJECT_KEY                          -> S3 key for plots state json (default: uit_alwar_plots.json)
+  OBJECT_KEY_NEWS                     -> S3 key for news state json  (default: uit_alwar_news.json)
 
 Notifications (optional; if not set, script skips notify step):
   TELEGRAM_BOT_TOKEN                  -> Telegram bot token from @BotFather
@@ -20,14 +23,17 @@ Optional tuning / resiliency:
   FALLBACK_DETAIL_URL                 -> If summary parsing fails, use this direct URL for UIT, Alwar schemes
 
 AWS creds:
-  Use IAM creds with s3:ListBucket on the bucket, and s3:GetObject/s3:PutObject on OBJECT_KEY.
+  Use IAM creds with s3:ListBucket on the bucket, and s3:GetObject/s3:PutObject on OBJECT_KEY & OBJECT_KEY_NEWS.
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
 import logging
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import boto3
 import botocore.exceptions
@@ -49,6 +55,7 @@ if not logger.handlers:
 # -----------------------
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
 OBJECT_KEY = os.environ.get("OBJECT_KEY", "uit_alwar_plots.json")
+OBJECT_KEY_NEWS = os.environ.get("OBJECT_KEY_NEWS", "uit_alwar_news.json")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -60,12 +67,15 @@ FALLBACK_DETAIL_URL = os.environ.get("FALLBACK_DETAIL_URL")  # optional manual o
 BASE_URL = "https://udhonline.rajasthan.gov.in"
 SUMMARY_URL = f"{BASE_URL}/Portal/AuctionListNew"
 
+NEWS_BASE = "http://uitalwar.rajasthan.gov.in"
+NEWS_URL = f"{NEWS_BASE}/Auction.aspx"
+
 # -----------------------
 # HTTP helpers
 # -----------------------
 def _get(session: requests.Session, url: str, params: dict | None = None) -> BeautifulSoup:
     """
-    GET with a browser-ish User-Agent and optional params.
+    GET with a browser-ish User-Agent and optional params (3.11 syntax).
     """
     headers = {
         "User-Agent": (
@@ -83,9 +93,7 @@ def _get(session: requests.Session, url: str, params: dict | None = None) -> Bea
     return BeautifulSoup(resp.text, "html.parser")
 
 def fetch_unit_wise_summary(session: requests.Session) -> BeautifulSoup:
-    """
-    Fetch the 'Live E-Auctions' summary page with a cache buster.
-    """
+    """Fetch the 'Live E-Auctions' summary page with a cache buster."""
     return _get(session, SUMMARY_URL, params={"_": "nocache"})
 
 # -----------------------
@@ -96,21 +104,17 @@ def extract_uit_alwar_link(soup: BeautifulSoup) -> str:
     Find the UIT, Alwar row in the Unit Wise Summary table and return the first link href.
     NOTE: Unit Name is in the 2nd column (index 1). First column is S.No.
     """
-    # Try to locate the summary table, but be robust if headings differ
     hdr = soup.find(lambda tag: tag.name in ("h2", "h3", "h4") and "Unit Wise Summary" in tag.get_text(strip=True))
     table = hdr.find_next("table") if hdr else soup.find("table")
     if not table:
-        # fallback: scan any tables
         tables = soup.find_all("table")
         if not tables:
-            # ultimate fallback: manual override
             if FALLBACK_DETAIL_URL:
                 logger.warning("No table found; using FALLBACK_DETAIL_URL.")
                 return FALLBACK_DETAIL_URL
             raise ValueError("Could not find unit summary table")
         table = tables[0]
 
-    # Primary: read unit from 2nd column
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) >= 2:
@@ -141,7 +145,7 @@ def extract_uit_alwar_link(soup: BeautifulSoup) -> str:
 # -----------------------
 # UIT, Alwar detail -> schemes list
 # -----------------------
-def fetch_scheme_list(session: requests.Session, detail_url: str) -> List[Dict[str, str]]:
+def fetch_scheme_list(session: requests.Session, detail_url: str) -> list[dict[str, str]]:
     """
     Parse the detail page showing schemes (name + count link) -> return list[{scheme_name, href, count}]
     """
@@ -151,7 +155,7 @@ def fetch_scheme_list(session: requests.Session, detail_url: str) -> List[Dict[s
         logger.warning("No schemes table found on UIT, Alwar detail page")
         return []
 
-    out: List[Dict[str, str]] = []
+    out: list[dict[str, str]] = []
     rows = table.find_all("tr")
     # assume first row is header
     for row in rows[1:]:
@@ -169,19 +173,19 @@ def fetch_scheme_list(session: requests.Session, detail_url: str) -> List[Dict[s
 # -----------------------
 # Scheme page -> plot details (with optional detail_url)
 # -----------------------
-def fetch_plot_details(session: requests.Session, scheme_url: str) -> List[Dict[str, str]]:
+def fetch_plot_details(session: requests.Session, scheme_url: str) -> list[dict[str, str]]:
     """
     Parse scheme page with "Auction Details" list. Return plots[]
     Each plot dict includes:
       id, title, scheme_name, property_number, area, usage_type, emd_start, emd_end, emd_amount, bid_start, bid_end, assessed_value, detail_url?
     """
     soup = _get(session, scheme_url)
-    result: List[Dict[str, str]] = []
+    result: list[dict[str, str]] = []
 
     # The page tends to have an UL/LI list with lines like "Id :", "Title :", etc.
     # We'll treat a new "Id :" as start of a new plot block.
     lis = soup.find_all("li")
-    plot: Dict[str, str] = {}
+    plot: dict[str, str] = {}
 
     def flush():
         nonlocal plot
@@ -189,7 +193,7 @@ def fetch_plot_details(session: requests.Session, scheme_url: str) -> List[Dict[
             result.append(plot)
             plot = {}
 
-    def capture_link_from_li(li) -> Optional[str]:
+    def capture_link_from_li(li) -> str | None:
         a = li.find("a", href=True)
         if a and a["href"]:
             return requests.compat.urljoin(scheme_url, a["href"])
@@ -209,7 +213,6 @@ def fetch_plot_details(session: requests.Session, scheme_url: str) -> List[Dict[
             # new plot starts
             flush()
             plot["id"] = text.split(":", 1)[1].strip()
-            # if the current LI had a link, detail_url was already set above
             continue
 
         # field mappings
@@ -244,11 +247,68 @@ def fetch_plot_details(session: requests.Session, scheme_url: str) -> List[Dict[
     return result
 
 # -----------------------
+# UIT Alwar Newsletter scrape (by exact table id)
+# -----------------------
+def fetch_newsletters(session: requests.Session) -> list[dict[str, str]]:
+    """
+    Scrape http://uitalwar.rajasthan.gov.in/Auction.aspx
+    Table: id='ContentPlaceHolder1_gridview1'
+    Columns (by index):
+      0: Sr.No.
+      1: Auction Date
+      2: Auction Detail
+      3: Venue and Time for Auction
+      4: Uploaded File (anchor)
+    Returns items with keys: id, date, detail, venue_time, url, title
+    """
+    soup = _get(session, NEWS_URL, params={"_": "nocache"})
+    table = soup.find("table", id="ContentPlaceHolder1_gridview1")
+    if not table:
+        logger.warning("News table not found: ContentPlaceHolder1_gridview1")
+        return []
+
+    items: list[dict[str, str]] = []
+    rows = table.find_all("tr")
+    for tr in rows:
+        ths = tr.find_all("th")
+        if ths:
+            # header row -> skip
+            continue
+        tds = tr.find_all("td")
+        if len(tds) < 5:
+            continue
+
+        date_txt = tds[1].get_text(" ", strip=True)
+        detail_txt = tds[2].get_text(" ", strip=True)
+        venue_txt = tds[3].get_text(" ", strip=True)
+
+        # Uploaded file link
+        a = tds[4].find("a", href=True)
+        url = requests.compat.urljoin(NEWS_URL, a["href"]) if a else ""
+        title = a.get_text(" ", strip=True) if a else "View Document"
+
+        # Make a stable ID (prefer the file URL if available)
+        key_src = url or f"{date_txt}|{detail_txt}|{venue_txt}"
+        digest = hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:16]
+
+        items.append({
+            "id": digest,
+            "date": date_txt,
+            "detail": detail_txt,
+            "venue_time": venue_txt,
+            "url": url,
+            "title": title,
+        })
+
+    logger.info("Newsletters discovered (table rows): %d", len(items))
+    return items
+
+# -----------------------
 # State: S3 read/write
 # -----------------------
-def load_previous_plots(s3_client: boto3.client) -> List[Dict[str, str]]:
+def load_json(s3_client: boto3.client, key: str) -> list[dict[str, str]]:
     try:
-        resp = s3_client.get_object(Bucket=BUCKET_NAME, Key=OBJECT_KEY)
+        resp = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
         body = resp["Body"].read().decode("utf-8")
         return json.loads(body) if body else []
     except botocore.exceptions.ClientError as e:
@@ -256,16 +316,16 @@ def load_previous_plots(s3_client: boto3.client) -> List[Dict[str, str]]:
             return []
         raise
 
-def save_current_plots(s3_client: boto3.client, plots: List[Dict[str, str]]) -> None:
-    s3_client.put_object(Bucket=BUCKET_NAME, Key=OBJECT_KEY, Body=json.dumps(plots, ensure_ascii=False))
+def save_json(s3_client: boto3.client, key: str, payload: list[dict[str, str]]) -> None:
+    s3_client.put_object(Bucket=BUCKET_NAME, Key=key, Body=json.dumps(payload, ensure_ascii=False))
 
 # -----------------------
-# Telegram notifications (per-plot)
+# Telegram notifications (per-item)
 # -----------------------
-def _fmt(val: Optional[str]) -> str:
+def _fmt(val: str | None) -> str:
     return (val or "").strip()
 
-def _build_plot_message_html(p: Dict[str, str]) -> str:
+def _build_plot_message_html(p: dict[str, str]) -> str:
     link_html = ""
     if p.get("detail_url"):
         link_html = f'\n<a href="{_fmt(p["detail_url"])}">🔗 View Plot Details</a>'
@@ -284,19 +344,35 @@ def _build_plot_message_html(p: Dict[str, str]) -> str:
     ]
     return "\n".join(parts) + link_html
 
-def send_telegram_messages_per_plot(new_plots: List[Dict[str, str]]) -> None:
+def _build_news_message_html(n: dict[str, str]) -> str:
+    parts = [
+        "<b>UIT, Alwar – New Auction Newsletter</b>",
+        f"<b>Auction Date:</b> { _fmt(n.get('date')) }",
+        f"<b>Detail:</b> { _fmt(n.get('detail')) }",
+        f"<b>Venue & Time:</b> { _fmt(n.get('venue_time')) }",
+    ]
+    url = _fmt(n.get("url"))
+    title = _fmt(n.get("title")) or "View Document"
+    if url:
+        parts.append(f'<a href="{url}">📄 {title}</a>')
+    return "\n".join(parts)
+
+def send_telegram_messages(items: list[dict[str, str]], builder) -> None:
+    """
+    Send one message per item using `builder(item) -> HTML text`.
+    """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         logger.warning("Telegram creds not set; skipping notification step.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     sent = 0
-    for p in new_plots:
+    for it in items:
         if sent >= TELEGRAM_MAX_MESSAGES:
             logger.warning("Hit TELEGRAM_MAX_MESSAGES cap (%s). Not sending more.", TELEGRAM_MAX_MESSAGES)
             break
 
-        msg = _build_plot_message_html(p)
+        msg = builder(it)
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": msg,
@@ -307,9 +383,9 @@ def send_telegram_messages_per_plot(new_plots: List[Dict[str, str]]) -> None:
             r = requests.post(url, data=payload, timeout=20)
             r.raise_for_status()
             sent += 1
-            logger.info("Sent Telegram message for plot id=%s", p.get("id"))
+            logger.info("Sent Telegram message for item id=%s", it.get("id"))
         except Exception as e:
-            logger.warning("Failed to send Telegram message for plot id=%s: %s", p.get("id"), e)
+            logger.warning("Failed to send Telegram message for item id=%s: %s", it.get("id"), e)
 
         time.sleep(TELEGRAM_MESSAGE_DELAY_MS / 1000.0)
 
@@ -322,16 +398,15 @@ def lambda_handler(event, context):
         return {"statusCode": 500, "body": "Missing BUCKET_NAME"}
 
     session = requests.Session()
+    s3 = boto3.client("s3")
+
     try:
-        # 1) Summary -> UIT, Alwar link
+        # ====== PLOTS ======
         summary = fetch_unit_wise_summary(session)
         detail_link = extract_uit_alwar_link(summary)
-
-        # 2) UIT, Alwar schemes
         schemes = fetch_scheme_list(session, detail_link)
 
-        # 3) Scrape plots per scheme
-        all_plots: List[Dict[str, str]] = []
+        all_plots: list[dict[str, str]] = []
         for s in schemes:
             if not s.get("href"):
                 continue
@@ -342,26 +417,29 @@ def lambda_handler(event, context):
                 p.setdefault("detail_url", s.get("href"))
             all_plots.extend(plots)
 
-        # 4) Load previous, detect new by plot id
-        s3 = boto3.client("s3")
-        prev = load_previous_plots(s3)
-        prev_ids = {x.get("id") for x in prev if x.get("id")}
+        prev_plots = load_json(s3, OBJECT_KEY)
+        prev_ids = {x.get("id") for x in prev_plots if x.get("id")}
         new_plots = [p for p in all_plots if p.get("id") and p["id"] not in prev_ids]
-
-        logger.info(f"Total plots now: {len(all_plots)} | New: {len(new_plots)}")
-
-        # 5) Save current for next run
-        save_current_plots(s3, all_plots)
-
-        # 6) Notify
+        save_json(s3, OBJECT_KEY, all_plots)
         if new_plots:
-            send_telegram_messages_per_plot(new_plots)
+            send_telegram_messages(new_plots, _build_plot_message_html)
+
+        # ====== NEWSLETTERS ======
+        news_now = fetch_newsletters(session)
+        prev_news = load_json(s3, OBJECT_KEY_NEWS)
+        prev_news_ids = {x.get("id") for x in prev_news if x.get("id")}
+        new_news = [n for n in news_now if n.get("id") and n["id"] not in prev_news_ids]
+        save_json(s3, OBJECT_KEY_NEWS, news_now)
+        if new_news:
+            send_telegram_messages(new_news, _build_news_message_html)
 
         return {
             "statusCode": 200,
             "body": json.dumps({
                 "total_plots": len(all_plots),
                 "new_plots": len(new_plots),
+                "total_news": len(news_now),
+                "new_news": len(new_news),
             })
         }
     except Exception as exc:
