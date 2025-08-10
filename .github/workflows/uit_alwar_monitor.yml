@@ -2,36 +2,46 @@ name: run-monitor
 
 on:
   schedule:
-    - cron: '30 5 * * *' # 11:00 AM IST
+    - cron: '30 5 * * *' # 11:00 AM IST (GitHub Actions uses UTC)
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: run-monitor
+  cancel-in-progress: false
+
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v3
+    timeout-minutes: 20
 
-      - uses: actions/setup-python@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run monitor
         env:
+          # AWS
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }} # e.g. us-east-2
+          # S3
+          BUCKET_NAME: ${{ secrets.BUCKET_NAME }} # jda-auction-list
           OBJECT_KEY: uit_alwar_plots.json
           OBJECT_KEY_NEWS: uit_alwar_news.json
+          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Throttling (avoid 429s)
           TELEGRAM_MIN_INTERVAL_MS: '1200'
-          TELEGRAM_MAX_MESSAGES: '20'
         run: python lambda_function.py
