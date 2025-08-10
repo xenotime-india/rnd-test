@@ -1,50 +1,37 @@
-name: UIT Alwar Auction Monitor
-
-# This GitHub Actions workflow runs a Python script that monitors the
-# Rajasthan UDH live auctions portal for UIT, Alwar plots. It runs on
-# a schedule (once per day by default) and sends Telegram notifications
-# when new plots are listed. The script stores state (the list of plots
-# and the last total count) in an S3 bucket; thus you must configure
-# AWS credentials and bucket details via repository secrets or variables.
+name: run-monitor
 
 on:
-  # Adjust the cron expression to control how frequently the job runs.
-  # The example below runs every day at 04:00 UTC (09:30 IST).
   schedule:
-    - cron: '0 4 * * *'
-  # Allow manual runs via the Actions tab
+    - cron: '30 5 * * *' # 11:00 AM IST
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run UIT Alwar monitor
+      - name: Run monitor
         env:
-          # AWS credentials for accessing S3. These should be stored
-          # securely in GitHub secrets. The IAM user should have
-          # permissions for s3:GetObject and s3:PutObject on the bucket
-          # specified below.
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
-
-          # Parameters for the monitor script. Store these in secrets or
-          # repository variables to avoid exposing sensitive data.
           BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
           OBJECT_KEY: uit_alwar_plots.json
+          OBJECT_KEY_NEWS: uit_alwar_news.json
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python lambda_function.py
+          TELEGRAM_MIN_INTERVAL_MS: '1200'
+          TELEGRAM_MAX_MESSAGES: '20'
+        run: python lambda_function.py
