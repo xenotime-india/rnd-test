@@ -12,6 +12,7 @@ Features:
 - Saves updated state to S3
 """
 
+import datetime
 import hashlib
 import json
 import logging
@@ -221,7 +222,8 @@ def lambda_handler(event, context):
         for plot in new_plots:
             send_telegram_message(build_plot_message(plot))
     else:
-        send_telegram_message("ℹ️ No new plots found today.")
+        today = datetime.date.today().strftime("%d-%m-%Y")
+        send_telegram_message(f"ℹ️ No new plots found today ({today}).")
 
     # Newsletters
     news_now = fetch_newsletters(session)
@@ -233,7 +235,8 @@ def lambda_handler(event, context):
         for news in new_news:
             send_telegram_message(build_news_message(news))
     else:
-        send_telegram_message("ℹ️ No new newsletters found today.")
+        today = datetime.date.today().strftime("%d-%m-%Y")
+        send_telegram_message(f"ℹ️ No new newsletters found today ({today}).")
 
     return {"statusCode": 200}
 
