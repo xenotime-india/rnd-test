@@ -28,6 +28,7 @@ AWS creds:
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import logging
@@ -356,6 +357,18 @@ def _build_news_message_html(n: dict[str, str]) -> str:
     if url:
         parts.append(f'<a href="{url}">📄 {title}</a>')
     return "\n".join(parts)
+
+def send_telegram_message(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram not configured")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    requests.post(url, data={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    })
 
 def send_telegram_messages(items: list[dict[str, str]], builder) -> None:
     """
