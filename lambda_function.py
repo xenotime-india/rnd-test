@@ -20,7 +20,6 @@ Notifications (optional; if not set, script skips notify step):
 Optional tuning / resiliency:
   TELEGRAM_MESSAGE_DELAY_MS           -> ms delay between sends (default 400)
   TELEGRAM_MAX_MESSAGES               -> safety cap per run (default 50)
-  FALLBACK_DETAIL_URL                 -> If summary parsing fails, use this direct URL for UIT, Alwar schemes
 
 AWS creds:
   Use IAM creds with s3:ListBucket on the bucket, and s3:GetObject/s3:PutObject on OBJECT_KEY & OBJECT_KEY_NEWS.
@@ -63,8 +62,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_MESSAGE_DELAY_MS = int(os.environ.get("TELEGRAM_MESSAGE_DELAY_MS", "400"))
 TELEGRAM_MAX_MESSAGES = int(os.environ.get("TELEGRAM_MAX_MESSAGES", "50"))
 
-FALLBACK_DETAIL_URL = os.environ.get("FALLBACK_DETAIL_URL")  # optional manual override
-
 BASE_URL = "https://udhonline.rajasthan.gov.in"
 SUMMARY_URL = f"{BASE_URL}/Portal/AuctionListNew"
 
@@ -104,18 +101,31 @@ def extract_uit_alwar_link(soup: BeautifulSoup) -> str:
     """
     Find the UIT, Alwar row in the Unit Wise Summary table and return the first link href.
     NOTE: Unit Name is in the 2nd column (index 1). First column is S.No.
+    Raises ValueError if UIT, Alwar is not found.
     """
     hdr = soup.find(lambda tag: tag.name in ("h2", "h3", "h4") and "Unit Wise Summary" in tag.get_text(strip=True))
     table = hdr.find_next("table") if hdr else soup.find("table")
     if not table:
         tables = soup.find_all("table")
         if not tables:
-            if FALLBACK_DETAIL_URL:
-                logger.warning("No table found; using FALLBACK_DETAIL_URL.")
-                return FALLBACK_DETAIL_URL
             raise ValueError("Could not find unit summary table")
         table = tables[0]
 
+    # Log all available UIT entries for debugging
+    available_units = []
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) >= 2:
+            unit_name = " ".join(tds[1].get_text(strip=True).split())
+            if unit_name.lower().startswith("uit"):
+                available_units.append(unit_name)
+    
+    if available_units:
+        logger.info(f"Available UIT units found: {available_units}")
+    else:
+        logger.warning("No UIT units found in the summary table")
+
+    # Primary search: look for UIT, Alwar specifically
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) >= 2:
@@ -127,7 +137,7 @@ def extract_uit_alwar_link(soup: BeautifulSoup) -> str:
                     logger.info(f"Found UIT, Alwar link: {href}")
                     return href
 
-    # Fallback: scan row text
+    # Fallback: scan row text for both "uit" and "alwar"
     for tr in table.find_all("tr"):
         row_text = " ".join(tr.get_text(" ", strip=True).split()).lower()
         if "uit" in row_text and "alwar" in row_text:
@@ -137,11 +147,10 @@ def extract_uit_alwar_link(soup: BeautifulSoup) -> str:
                 logger.info(f"Found UIT, Alwar link via fallback scan: {href}")
                 return href
 
-    if FALLBACK_DETAIL_URL:
-        logger.warning("Using FALLBACK_DETAIL_URL due to summary parse failure.")
-        return FALLBACK_DETAIL_URL
-
-    raise ValueError("UIT, Alwar row not found in summary table")
+    # Provide a more informative error message
+    error_msg = f"UIT, Alwar row not found in summary table. Available UIT units: {available_units}"
+    logger.error(error_msg)
+    raise ValueError(error_msg)
 
 # -----------------------
 # UIT, Alwar detail -> schemes list
@@ -413,58 +422,84 @@ def lambda_handler(event, context):
     session = requests.Session()
     s3 = boto3.client("s3")
 
+    # Initialize default values
+    all_plots = []
+    new_plots = []
+    news_now = []
+    new_news = []
+    
+    # ====== PLOTS ======
     try:
-        # ====== PLOTS ======
+        logger.info("Starting plot parsing...")
         summary = fetch_unit_wise_summary(session)
-        detail_link = extract_uit_alwar_link(summary)
-        schemes = fetch_scheme_list(session, detail_link)
+        try:
+            detail_link = extract_uit_alwar_link(summary)
+            schemes = fetch_scheme_list(session, detail_link)
 
-        all_plots: list[dict[str, str]] = []
-        for s in schemes:
-            if not s.get("href"):
-                continue
-            plots = fetch_plot_details(session, s["href"])
-            for p in plots:
-                p.setdefault("scheme_name", s.get("scheme_name"))
-                # If no detail_url captured from LI, fallback to scheme page (at least something clickable)
-                p.setdefault("detail_url", s.get("href"))
-            all_plots.extend(plots)
+            for s in schemes:
+                if not s.get("href"):
+                    continue
+                plots = fetch_plot_details(session, s["href"])
+                for p in plots:
+                    p.setdefault("scheme_name", s.get("scheme_name"))
+                    # If no detail_url captured from LI, fallback to scheme page (at least something clickable)
+                    p.setdefault("detail_url", s.get("href"))
+                all_plots.extend(plots)
 
-        prev_plots = load_json(s3, OBJECT_KEY)
-        prev_ids = {x.get("id") for x in prev_plots if x.get("id")}
-        new_plots = [p for p in all_plots if p.get("id") and p["id"] not in prev_ids]
-        save_json(s3, OBJECT_KEY, all_plots)
-        if new_plots:
-            send_telegram_messages(new_plots, _build_plot_message_html)
-        else:
+            prev_plots = load_json(s3, OBJECT_KEY)
+            prev_ids = {x.get("id") for x in prev_plots if x.get("id")}
+            new_plots = [p for p in all_plots if p.get("id") and p["id"] not in prev_ids]
+            save_json(s3, OBJECT_KEY, all_plots)
+            
+            if new_plots:
+                send_telegram_messages(new_plots, _build_plot_message_html)
+                logger.info(f"Sent notifications for {len(new_plots)} new plots")
+            else:
+                today = datetime.date.today().strftime("%d-%m-%Y")
+                send_telegram_message(f"ℹ️ No new plots found today ({today}).")
+                
+        except ValueError as e:
+            # Handle case where UIT, Alwar is not found
+            logger.warning(f"UIT, Alwar not found in current auctions: {e}")
             today = datetime.date.today().strftime("%d-%m-%Y")
-            send_telegram_message(f"ℹ️ No new plots found today ({today}).")
+            send_telegram_message(f"⚠️ UIT, Alwar not found in current auctions ({today}). {str(e)}")
+            # Keep all_plots and new_plots as empty lists
+            
+    except Exception as e:
+        logger.exception("Plot parsing failed")
+        today = datetime.date.today().strftime("%d-%m-%Y")
+        send_telegram_message(f"❌ Plot parsing failed ({today}): {str(e)}")
 
-
-        # ====== NEWSLETTERS ======
+    # ====== NEWSLETTERS ======
+    try:
+        logger.info("Starting newsletter parsing...")
         news_now = fetch_newsletters(session)
         prev_news = load_json(s3, OBJECT_KEY_NEWS)
         prev_news_ids = {x.get("id") for x in prev_news if x.get("id")}
         new_news = [n for n in news_now if n.get("id") and n["id"] not in prev_news_ids]
         save_json(s3, OBJECT_KEY_NEWS, news_now)
+        
         if new_news:
             send_telegram_messages(new_news, _build_news_message_html)
+            logger.info(f"Sent notifications for {len(new_news)} new newsletters")
         else:
             today = datetime.date.today().strftime("%d-%m-%Y")
             send_telegram_message(f"ℹ️ No new newsletters found today ({today}).")
+            
+    except Exception as e:
+        logger.exception("Newsletter parsing failed")
+        today = datetime.date.today().strftime("%d-%m-%Y")
+        send_telegram_message(f"❌ Newsletter parsing failed ({today}): {str(e)}")
 
-        return {
-            "statusCode": 200,
-            "body": json.dumps({
-                "total_plots": len(all_plots),
-                "new_plots": len(new_plots),
-                "total_news": len(news_now),
-                "new_news": len(new_news),
-            })
-        }
-    except Exception as exc:
-        logger.exception("Execution failed")
-        return {"statusCode": 500, "body": str(exc)}
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "total_plots": len(all_plots),
+            "new_plots": len(new_plots),
+            "total_news": len(news_now),
+            "new_news": len(new_news),
+        })
+    }
 
 # -----------------------
 # Allow running via `python lambda_function.py`
